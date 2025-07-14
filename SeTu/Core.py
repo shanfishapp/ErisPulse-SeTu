@@ -22,7 +22,7 @@ class Main:
             return
             
         text = data.get("alt_message", "").strip().lower()
-        if text in ["/随机图片", "随机图片", "/图片", "图片"]:
+        if text in ["/随机色图", "随机色图", "/色图", "色图"]:
             await self._process_image_request(data)
 
     async def _process_image_request(self, data):
