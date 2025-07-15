@@ -1,6 +1,8 @@
 from ErisPulse import sdk
 import aiohttp
 import asyncio
+import os
+from urllib.parse import unquote, urlparse
 
 class Main:
     def __init__(self):
@@ -9,7 +11,12 @@ class Main:
         self.adapter = sdk.adapter
         self._register_handlers()
         self.output_to_logger = None
-    
+        self.max_retries = 10
+        self.temp_dir = "temp_images"
+        
+        # 创建临时目录
+        os.makedirs(self.temp_dir, exist_ok=True)
+
     @staticmethod
     def should_eager_load() -> bool:
         return True
@@ -24,7 +31,7 @@ class Main:
             
         text = data.get("alt_message", "").strip().lower()
         if text in ["/随机色图", "随机色图", "/色图", "色图"]:
-            await self._process_image_request(data)
+            asyncio.create_task(self._process_image_request(data))
 
     async def _process_image_request(self, data):
         try:
@@ -33,24 +40,60 @@ class Main:
                 await self._send_warning_text(data, "平台不支持图片发送")
                 return
 
-            image_url = await self._fetch_image_url(data)
-            
-            adapter_name = data.get("self", {}).get("platform")
-            if adapter_name == "yunhu":
-                await sender.Image(
-                    self._stream_download(image_url),
-                    stream=True
-                )
-            elif adapter_name == "onebot11":
-                await sender.Image(image_url)
-            else:
-                image_bytes = await self._download_full_image(image_url)
-                await sender.Image(image_bytes)
+            retry_count = 0
+            while retry_count < self.max_retries:
+                temp_path = None
+                try:
+                    # 获取图片URL
+                    image_url = await self._fetch_image_url(data)
+                    if not image_url:
+                        retry_count += 1
+                        continue
 
-            self.logger.info("图片发送成功")
+                    # 获取原始文件名
+                    file_name = self._get_filename_from_url(image_url)
+                    temp_path = os.path.join(self.temp_dir, file_name)
+
+                    # 下载文件
+                    await self._download_to_file(image_url, temp_path)
+
+                    # 读取文件内容
+                    with open(temp_path, 'rb') as f:
+                        image_data = f.read()
+
+                    # 发送图片（不再使用stream=True）
+                    adapter_name = data.get("self", {}).get("platform")
+                    if adapter_name == "yunhu":
+                        await sender.Image(image_data)
+                    elif adapter_name == "onebot11":
+                        await sender.Image(temp_path)  # onebot11支持文件路径
+                    else:
+                        await sender.Image(image_data)
+
+                    self.logger.info(f"图片发送成功: {file_name}")
+                    break
+
+                except aiohttp.ClientError as e:
+                    if "404" in str(e):
+                        retry_count += 1
+                        self.logger.warning(f"图片下载404错误，正在重试...({retry_count}/{self.max_retries})")
+                        continue
+                    await self._send_warning_text(data, f"图片下载失败: {str(e)}")
+                    return
+                except Exception as e:
+                    await self._send_warning_text(data, f"图片处理失败: {str(e)}")
+                    return
+                finally:
+                    # 清理临时文件
+                    if temp_path and os.path.exists(temp_path):
+                        await self._safe_delete(temp_path)
+
+            if retry_count >= self.max_retries:
+                await self._send_warning_text(data, "图片获取失败，已达到最大重试次数")
 
         except Exception as e:
             self.logger.error(f"图片处理失败: {str(e)}")
+            await self._send_warning_text(data, f"图片处理失败: {str(e)}")
 
     async def _get_adapter_sender(self, data):
         detail_type = data.get("detail_type", "private")
@@ -82,29 +125,47 @@ class Main:
         async with aiohttp.ClientSession() as session:
             async with session.get("https://api.lolicon.app/setu/v2") as resp:
                 if resp.status != 200:
-                    await self._send_warning_text(data, f"图片URL获取失败({resp.status})")
-                    return
+                    self.logger.warning(f"图片URL获取失败({resp.status})")
+                    return None
                 json_data = await resp.json()
                 if json_data['error']:
-                     await self._send_warning_text(data, f"图片API返回错误({json_data['error']})")
-                     return
+                    self.logger.warning(f"图片API返回错误({json_data['error']})")
+                    return None
                 self.logger.info(json_data['data'][0]['urls']['original'])
                 return json_data['data'][0]['urls']['original']
 
-    async def _stream_download(self, url, chunk_size=256 * 1024):
+    def _get_filename_from_url(self, url):
+        # 从URL中提取文件名
+        parsed = urlparse(url)
+        filename = unquote(os.path.basename(parsed.path))
+        
+        # 如果没有扩展名，添加默认的.jpg
+        if not os.path.splitext(filename)[1]:
+            filename += ".jpg"
+            
+        # 确保文件名安全
+        return "".join(c for c in filename if c.isalnum() or c in ('_', '-', '.'))
+
+    async def _download_to_file(self, url, filepath):
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
-                if response.status != 200:
-                    self.logger.error(f"图片下载失败({response.status})")
-                    return
-                async for chunk in response.content.iter_chunked(chunk_size):
-                    yield chunk
-                    await asyncio.sleep(0.01)
-    
-    async def _download_full_image(self, url):
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    self.logger.error(f"图片下载失败({response.status})")
-                    return
-                return await response.read()
+                if response.status == 404:
+                    raise aiohttp.ClientError("404 Not Found")
+                elif response.status != 200:
+                    raise aiohttp.ClientError(f"HTTP Error {response.status}")
+                
+                # 异步写入文件
+                with open(filepath, 'wb') as f:
+                    while True:
+                        chunk = await response.content.read(1024 * 1024)  # 1MB chunks
+                        if not chunk:
+                            break
+                        f.write(chunk)
+
+    async def _safe_delete(self, filepath):
+        try:
+            if os.path.exists(filepath):
+                os.unlink(filepath)
+                self.logger.debug(f"已删除临时文件: {filepath}")
+        except Exception as e:
+            self.logger.warning(f"删除临时文件失败: {filepath}, 错误: {str(e)}")
