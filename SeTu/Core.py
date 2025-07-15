@@ -39,7 +39,10 @@ class Main:
             if not hasattr(sender, 'Image'):
                 await self._send_warning_text(data, "平台不支持图片发送")
                 return
-
+            if hasattr(sender, "Text"):
+                msg_id_data = await sender.Text("收到了喵~正在为您准备图片喵~")
+            else:
+                self.logger.warning("平台不支持文本发送")
             retry_count = 0
             while retry_count < self.max_retries:
                 temp_path = None
@@ -63,12 +66,11 @@ class Main:
 
                     # 发送图片（不再使用stream=True）
                     adapter_name = data.get("self", {}).get("platform")
-                    if adapter_name == "yunhu":
-                        await sender.Image(image_data)
-                    elif adapter_name == "onebot11":
-                        await sender.Image(temp_path)  # onebot11支持文件路径
+                    if hasattr(sender, "Edit"):
+                        sender.Edit(msg_id_data['data']['messageInfo']['msgId'], "准备好了喵~尽情欣赏吧~")
                     else:
-                        await sender.Image(image_data)
+                        self.logger.warning("平台不支持编辑消息，将不会编辑消息")
+                    await sender.Image(image_data)
 
                     self.logger.info(f"图片发送成功: {file_name}")
                     break
