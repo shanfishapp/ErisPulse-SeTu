@@ -8,6 +8,7 @@ class Main:
         self.logger = sdk.logger
         self.adapter = sdk.adapter
         self._register_handlers()
+        self.output_to_logger = None
     
     @staticmethod
     def should_eager_load() -> bool:
@@ -29,13 +30,10 @@ class Main:
         try:
             sender = await self._get_adapter_sender(data)
             if not hasattr(sender, 'Image'):
-                self.logger.warning(f"平台不支持图片发送")
+                await self._send_warning_text(data, "平台不支持图片发送")
                 return
 
-            image_url = await self._fetch_image_url()
-            if not image_url:
-                self.logger.warning("图片API请求失败")
-                return
+            image_url = await self._fetch_image_url(data)
             
             adapter_name = data.get("self", {}).get("platform")
             if adapter_name == "yunhu":
@@ -61,17 +59,35 @@ class Main:
         
         self.logger.info(f"获取到消息来源: {adapter_name} {detail_type} {datail_id}")
         if not adapter_name:
-            raise ValueError("无法获取消息来源平台")
+            self.logger.warning("无法获取消息来源平台")
             
         adapter = getattr(self.sdk.adapter, adapter_name)
         return adapter.Send.To("user" if detail_type == "private" else "group", datail_id)
 
-    async def _fetch_image_url(self):
+    async def _send_warning_text(self, data, text):
+        sender = await self._get_adapter_sender(data)
+        if hasattr(sender, "Text"):
+            await sender.Text(text)
+            return
+        else:
+            if not self.output_to_logger:
+                self.logger.warning(f"平台不支持发送文字反馈，将输出到日志")
+                self.output_to_logger = True
+                self.logger.warning(text)
+            else:
+                self.logger.warning(text)
+            return
+                
+    async def _fetch_image_url(self, data):
         async with aiohttp.ClientSession() as session:
             async with session.get("https://api.lolicon.app/setu/v2") as resp:
                 if resp.status != 200:
-                    return None
+                    await self._send_warning_text(data, f"图片URL获取失败({resp.status})")
+                    return
                 json_data = await resp.json()
+                if json_data['error']:
+                     await self._send_warning_text(data, f"图片API返回错误({json_data['error']})")
+                     return
                 self.logger.info(json_data['data'][0]['urls']['original'])
                 return json_data['data'][0]['urls']['original']
 
@@ -79,7 +95,8 @@ class Main:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 if response.status != 200:
-                    raise ValueError(f"下载失败，状态码: {response.status}")
+                    self.logger.error(f"图片下载失败({response.status})")
+                    return
                 async for chunk in response.content.iter_chunked(chunk_size):
                     yield chunk
                     await asyncio.sleep(0.01)
@@ -88,6 +105,6 @@ class Main:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 if response.status != 200:
-                    raise ValueError(f"下载失败，状态码: {response.status}")
+                    self.logger.error(f"图片下载失败({response.status})")
+                    return
                 return await response.read()
-                
