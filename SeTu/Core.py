@@ -435,18 +435,42 @@ class Main:
                 return json_data.get('data', [])
 
     async def _send_selected_images(self, data: Dict, selected_indices: List[int], results: List[Dict]):
+        sender = await self._get_adapter_sender(data)
+        
+        has_html = hasattr(sender, 'Html')
+        has_markdown = hasattr(sender, 'Markdown')
+        has_image = hasattr(sender, 'Image')
+        
         for idx in selected_indices:
             img = results[idx]
             image_url = next((u["url"] for u in img["urlsList"] if u["urlSize"] == "original"), None)
-            if image_url:
-                try:
+            if not image_url:
+                continue
+                
+            try:
+                if has_html or has_markdown:
+                    if has_html:
+                        html_content = f'<img src="{image_url}" />'
+                        await sender.Html(html_content)
+                    else:
+                        markdown_content = f'![]({image_url})'
+                        await sender.Markdown(markdown_content)
+                    
+                elif has_image:
+                    # 支持图片发送的平台下载后发送
                     image_data = await self._download_image(image_url)
                     if image_data:
-                        await self._send_image_response(data, image_data)
-                        await asyncio.sleep(0.5)
-                except Exception as e:
-                    self.logger.error(f"发送图片失败: {str(e)}")
-                    await self._send_text_response(data, f"图片发送失败: {img['title']}")
+                        await sender.Image(image_data)
+                    
+                else:
+                    # 都不支持的平台发送纯文本URL
+                    await sender.Text(f"{img['title']} 图片链接: {image_url}")
+                    
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                self.logger.error(f"发送图片失败: {str(e)}")
+                await self._send_text_response(data, f"图片发送失败: {img['title']}")
 
     async def _send_text_response(self, data: Dict, text: str):
         sender = await self._get_adapter_sender(data)
@@ -474,10 +498,11 @@ class Main:
     async def _process_image_request(self, data: Dict):
         try:
             sender = await self._get_adapter_sender(data)
-            if not hasattr(sender, 'Image'):
-                await self._send_warning_text(data, "平台不支持图片发送")
-                return
-                
+            
+            has_html = hasattr(sender, 'Html')
+            has_markdown = hasattr(sender, 'Markdown')
+            has_image = hasattr(sender, 'Image')
+            
             if hasattr(sender, "Text"):
                 msg_id_data = await sender.Text("收到了喵~正在为您准备图片喵~")
             else:
@@ -491,18 +516,31 @@ class Main:
                         retry_count += 1
                         continue
 
-                    image_data = await self._download_image(image_url)
-                    if not image_data:
-                        retry_count += 1
-                        continue
+                    if has_html or has_markdown:
+                        if has_html:
+                            html_content = f'<img src="{image_url}" />'
+                            await sender.Html(html_content)
+                        else:
+                            markdown_content = f'![]({image_url})'
+                            await sender.Markdown(markdown_content)
+                        
+                        self.logger.info("通过HTML/Markdown发送图片URL成功")
+                        
+                    elif has_image:
+                        image_data = await self._download_image(image_url)
+                        if not image_data:
+                            retry_count += 1
+                            continue
+                        
+                        await sender.Image(image_data)
+                        self.logger.info("图片下载并发送成功")
+                        
+                    else:
+                        await sender.Text(f"图片链接: {image_url}")
+                        self.logger.info("通过纯文本发送图片URL")
                     
                     if hasattr(sender, "Edit"):
                         await sender.Edit(msg_id_data.get("message_id", ""), "准备好了喵~尽情欣赏吧~")
-                    else:
-                        self.logger.warning("平台不支持编辑消息，将不会编辑消息")
-                        
-                    await sender.Image(image_data)
-                    self.logger.info("图片发送成功")
                     break
 
                 except aiohttp.ClientError as e:
@@ -510,7 +548,7 @@ class Main:
                         retry_count += 1
                         self.logger.warning(f"图片下载404错误，正在重试...({retry_count}/{self.max_retries})")
                         continue
-                    await self._send_warning_text(data, f"图片下载失败: {str(e)}")
+                    await self._send_warning_text(data, f"图片处理失败: {str(e)}")
                     return
                 except Exception as e:
                     await self._send_warning_text(data, f"图片处理失败: {str(e)}")
